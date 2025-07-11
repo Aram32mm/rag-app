@@ -3,6 +3,7 @@ import dash_bootstrap_components as dbc
 from dash_iconify import DashIconify
 import json
 from datetime import datetime
+import dash.exceptions
 
 from rag.generator import generate_response
 
@@ -16,6 +17,10 @@ def create_generator_component():
         ]),
         
         dbc.CardBody([
+            # Store for dropped rules
+            dcc.Store(id="stored-rules", data=[]),
+            dcc.Input(id="dropped-rule", type="text", style={"display": "none"}),
+
             # Drop zone for dragged rules
             html.Div([
                 DashIconify(icon="mdi:cloud-upload-outline", width=32, className="text-muted mb-2"),
@@ -80,9 +85,9 @@ def register_generator_callbacks(app):
          Input("chat-input", "n_submit")],
         [State("chat-input", "value"),
          State("chat-messages", "children"),
-         State("active-rules", "children")]
+         State("stored-rules", "data")]
     )
-    def handle_chat_message(n_clicks, n_submit, message, current_messages, active_rules):
+    def handle_chat_message(n_clicks, n_submit, message, current_messages, stored_rules):
         if not message or not message.strip():
             return current_messages
         
@@ -90,12 +95,11 @@ def register_generator_callbacks(app):
         new_messages = current_messages + [create_chat_message(message, is_user=True)]
         
         # Generate bot response
-        active_rule_data = []  # Extract from active_rules in real implementation
-        bot_response = generate_response(message, active_rule_data)
+        bot_response = generate_response(message, stored_rules or [])
         new_messages.append(create_chat_message(bot_response, is_user=False))
         
         return new_messages
-    
+
     @app.callback(
         Output("chat-input", "value"),
         [Input("send-btn", "n_clicks"),
@@ -107,15 +111,41 @@ def register_generator_callbacks(app):
             return ""
         return value
 
+    @app.callback(
+        Output("active-rules", "children"),
+        Input("stored-rules", "data")
+    )
+    def render_active_rule_chips(rules):
+        return [create_active_rule_chip(rule) for rule in rules]
+
+    @app.callback(
+        Output("stored-rules", "data"),
+        Input("dropped-rule", "value"),
+        State("stored-rules", "data"),
+        prevent_initial_call=True
+    )
+    def update_stored_rules(new_rule_json, current_rules):
+        if not new_rule_json:
+            raise dash.exceptions.PreventUpdate
+        try:
+            new_rule = json.loads(new_rule_json)
+            if not any(r["id"] == new_rule["id"] for r in current_rules):
+                current_rules.append(new_rule)
+            return current_rules
+        except Exception as e:
+            print("❌ Failed to parse dropped rule:", e)
+            raise dash.exceptions.PreventUpdate
+
     # Client-side callback for drag and drop functionality
     app.clientside_callback(
         """
         function(id) {
             const dropZone = document.getElementById('drop-zone');
             const activeRulesDiv = document.getElementById('active-rules');
+            const input = document.getElementById('dropped-rule');
             
-            if (!dropZone) return window.dash_clientside.no_update;
-            
+            if (!dropZone || !input) return window.dash_clientside.no_update;
+
             // Handle dragover
             dropZone.addEventListener('dragover', function(e) {
                 e.preventDefault();
@@ -141,6 +171,10 @@ def register_generator_callbacks(app):
                         chip.className = 'badge bg-light text-dark me-2 mb-2 active-rule-chip';
                         chip.innerHTML = rule.name + ' <span class="ms-2 remove-rule">×</span>';
                         activeRulesDiv.appendChild(chip);
+
+                        // Update backend store
+                        input.value = JSON.stringify(rule);
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
                     } catch (e) {
                         console.error('Error parsing rule data:', e);
                     }
