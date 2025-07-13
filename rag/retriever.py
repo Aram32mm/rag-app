@@ -15,7 +15,7 @@ from rank_bm25 import BM25Okapi
 from fuzzywuzzy import fuzz
 import re
 
-from embeddings import EmbeddingManager, EmbeddingIndex
+from .embeddings import EmbeddingManager, EmbeddingIndex
 
 logger = logging.getLogger(__name__)
 

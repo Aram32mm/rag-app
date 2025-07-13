@@ -4,3 +4,10 @@ dash-iconify
 plotly
 pandas
 numpy
+scikit-learn
+rank_bm25
+fuzzywuzzy
+torch
+transformers
+sentence-transformers
+python-Levenshtein
