@@ -33,13 +33,14 @@ h1 {
 /* Card styles */
 .search-card, .generator-card {
     border: none;
-    border-radius: 16px;
-    box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-    backdrop-filter: blur(10px);
-    background: rgba(255,255,255,0.95);
+    border-radius: 20px;
+    box-shadow: 0 25px 50px rgba(0, 0, 0, 0.12);
+    backdrop-filter: blur(14px);
+    background: rgba(255, 255, 255, 0.90);
     height: calc(100vh - 200px);
     overflow: hidden;
 }
+
 
 .card-header {
     background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
@@ -69,9 +70,27 @@ h1 {
     transition: all 0.2s ease;
 }
 
-.search-input:focus, .chat-input:focus {
+.search-input-simple {
+    border: 1px solid #cbd5e1;     /* light gray */
+    border-radius: 10px;
+    padding: 0.65rem 1rem;
+    font-size: 0.95rem;
+}
+
+.search-input-simple:focus {
     border-color: #6366f1;
-    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+    box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.15);
+}
+
+/* Separate clear button */
+.clear-btn-simple {
+    border-radius: 10px;
+    padding: 0.55rem 0.8rem;
+    transition: background 0.15s;
+}
+
+.clear-btn-simple:hover {
+    background: rgba(99, 102, 241, 0.07);
 }
 
 .filter-dropdown .Select-control {
@@ -97,22 +116,42 @@ h1 {
 /* Rule card styles */
 .rule-card {
     border: 1px solid #e5e7eb;
-    border-radius: 12px;
-    transition: all 0.2s ease;
+     border-radius: 14px;
+    transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
     cursor: grab;
     position: relative;
     background: white;
 }
 
+.rule-card .badge {
+  pointer-events: none;
+}
+
 .rule-card:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 25px rgba(0,0,0,0.1);
+    transform: translateY(-4px);    
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.12);
     border-color: #6366f1;
 }
 
 .rule-card:active {
     cursor: grabbing;
 }
+
+.rule-card-clickable {
+    cursor: grab;
+    transition: box-shadow 0.2s ease, transform 0.2s ease;
+    border-radius: 14px;
+    background: white;
+    border: 1px solid #e5e7eb;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.06);
+    position: relative;
+}
+
+.rule-card-clickable:hover {
+    border: 1px solid #6699ff;
+    box-shadow: 0 0 0 2px rgba(102, 153, 255, 0.2);
+}
+
 
 .rule-title {
     color: #1f2937;
@@ -131,8 +170,21 @@ h1 {
     transition: color 0.2s ease;
 }
 
-.rule-card:hover .drag-handle {
+.rule-card-clickable:active {
+    cursor: grabbing;
+}
+
+.rule-card-clickable .drag-handle {
+    color: #9ca3af;
+}
+
+.rule-card-clickable:hover .drag-handle {
     color: #6366f1;
+}
+
+.rule-card-clickable.drag-over {
+    border: 2px dashed #6366f1;
+    background: #f0f4ff;
 }
 
 /* Search results area */
@@ -343,4 +395,16 @@ h1 {
 
 .card-body::-webkit-scrollbar-thumb:hover {
     background: #94a3b8;
+}
+
+.offcanvas {
+    backdrop-filter: blur(12px);
+    background: rgba(255, 255, 255, 0.90);
+}
+
+mark {
+    background: #ede9fe;
+    color: #4f46e5;
+    padding: 0 0.15em;
+    border-radius: 4px;
 }

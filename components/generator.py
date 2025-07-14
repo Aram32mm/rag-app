@@ -1,197 +1,262 @@
-from dash import html, dcc, Input, Output, State, callback
-import dash_bootstrap_components as dbc
-from dash_iconify import DashIconify
-import json
-from datetime import datetime
-import dash.exceptions
+"""Rule Generator Module
+======================
+Dash component for dragging rule definitions into a *drop-zone*, chatting about
+those rules with a language-model backend, and generating new rule proposals.
 
+Public helpers
+--------------
+* ``create_generator_component`` – returns the ready-to-mount UI block.
+* ``register_generator_callbacks`` – attaches all server-side and client-side
+  callbacks.
+
+Everything else is private implementation detail.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Dict, List, Optional
+
+from dash import Input, Output, State, dcc, html
+import dash_bootstrap_components as dbc
+from dash.exceptions import PreventUpdate
+from dash_iconify import DashIconify
+
+# Local import – function that talks to your language-model backend
 from rag.generator import generate_response
 
-def create_generator_component():
-    return dbc.Card([
-        dbc.CardHeader([
-            html.H4([
-                DashIconify(icon="mdi:robot-outline", className="me-2"),
-                "Rule Generator"
-            ], className="mb-0 fw-semibold")
-        ]),
-        
-        dbc.CardBody([
-            # Store for dropped rules
-            dcc.Store(id="stored-rules", data=[]),
-            dcc.Input(id="dropped-rule", type="text", style={"display": "none"}),
+# ----------------------------------------------------------------------------
+# UI FACTORIES
+# ----------------------------------------------------------------------------
 
-            # Drop zone for dragged rules
-            html.Div([
-                DashIconify(icon="mdi:cloud-upload-outline", width=32, className="text-muted mb-2"),
-                html.P("Drag rules here to analyze", className="text-muted mb-0")
-            ], 
-            id="drop-zone", 
-            className="drop-zone text-center py-4 mb-3"
+def create_generator_component() -> dbc.Card:
+    """Return the fully-assembled *Rule Generator* card."""
+
+    return dbc.Card(
+        [
+            # ---------- Header --------------------------------------------------
+            dbc.CardHeader(
+                html.H4(
+                    [DashIconify(icon="mdi:robot-outline", className="me-2"), "Rule Generator"],
+                    className="mb-0 fw-semibold",
+                )
             ),
-            
-            # Active rules display
-            html.Div(id="active-rules", className="mb-3"),
-            
-            # Chat interface
-            html.Div([
-                # Chat messages
-                html.Div(
-                    id="chat-messages",
-                    className="chat-messages mb-3",
-                    children=[
-                        html.Div([
-                            DashIconify(icon="mdi:robot", className="me-2"),
-                            html.Span("Hi! I can help you analyze rules, create new ones, or answer questions. Drag some rules here to get started!", 
-                                    className="chat-message-text")
-                        ], className="chat-message bot-message")
-                    ]
-                ),
-                
-                # Input area
-                dbc.InputGroup([
-                    dbc.Input(
-                        id="chat-input",
-                        placeholder="Ask me about rules, or request new ones...",
-                        className="chat-input"
+            # ---------- Body ----------------------------------------------------
+            dbc.CardBody(
+                [
+                    # Stores / hidden input ----------------------------------
+                    dcc.Store(id="stored-rules", data=[]),
+                    dcc.Input(id="dropped-rule", type="text", style={"display": "none"}),
+                    dcc.Store(id="drop-zone-initialized", data=False),
+
+                    # Drop-zone ------------------------------------------------
+                    html.Div(
+                        [
+                            DashIconify(icon="mdi:cloud-upload-outline", width=32, className="text-muted mb-2"),
+                            html.P("Drag rules here to analyse", className="text-muted mb-0"),
+                        ],
+                        id="drop-zone",
+                        className="drop-zone text-center py-4 mb-3",
                     ),
-                    dbc.Button([
-                        DashIconify(icon="mdi:send", width=20)
-                    ], id="send-btn", color="primary")
-                ])
-            ])
-        ])
-    ], className="h-100 generator-card")
 
-def create_active_rule_chip(rule):
-    return dbc.Badge([
-        rule["name"],
-        html.Span("×", className="ms-2 remove-rule", **{"data-rule-id": rule.get("id", "")})
-    ], color="light", text_color="dark", className="me-2 mb-2 active-rule-chip")
+                    # Active rule chips ---------------------------------------
+                    html.Div(id="active-rules", className="mb-3"),
 
-def create_chat_message(content, is_user=True):
-    icon = "mdi:account" if is_user else "mdi:robot"
+                    # Chat interface -----------------------------------------
+                    html.Div(
+                        [
+                            html.Div(
+                                id="chat-messages",
+                                className="chat-messages mb-3",
+                                children=[
+                                    _create_chat_message(
+                                        "Hi! I can help you analyse rules, create new ones, or answer questions. "
+                                        "Drag some rules here to get started!",
+                                        is_user=False,
+                                    )
+                                ],
+                            ),
+                            dbc.InputGroup(
+                                [
+                                    dbc.Input(
+                                        id="chat-input",
+                                        placeholder="Ask me about rules, or request new ones…",
+                                        className="chat-input",
+                                    ),
+                                    dbc.Button(
+                                        DashIconify(icon="mdi:send", width=20),
+                                        id="send-btn",
+                                        color="primary",
+                                    ),
+                                ]
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+        ],
+        className="h-100 generator-card",
+    )
+
+
+# ----------------------------------------------------------------------------
+# Helper builders (private)
+# ----------------------------------------------------------------------------
+
+def _create_active_rule_chip(rule: Dict[str, Any]) -> dbc.Badge:
+    """Return a *pill* representing an active rule."""
+    return dbc.Badge(
+        [
+            rule.get("name", "Unnamed"),
+            html.Span("×", className="ms-2 remove-rule", **{"data-rule-id": rule.get("id", "")}),
+        ],
+        color="light",
+        text_color="dark",
+        className="me-2 mb-2 active-rule-chip",
+    )
+
+
+def _create_chat_message(content: str, *, is_user: bool = True) -> html.Div:
+    """Return a styled chat bubble for *user* or *bot* messages."""
+    icon_name = "mdi:account" if is_user else "mdi:robot"
     class_name = "user-message" if is_user else "bot-message"
-    
-    return html.Div([
-        DashIconify(icon=icon, className="me-2"),
-        html.Span(content, className="chat-message-text")
-    ], className=f"chat-message {class_name}")
 
-def register_generator_callbacks(app):
+    return html.Div(
+        [DashIconify(icon=icon_name, className="me-2"), html.Span(content, className="chat-message-text")],
+        className=f"chat-message {class_name}",
+    )
+
+
+# ----------------------------------------------------------------------------
+# Callback registration (public)
+# ----------------------------------------------------------------------------
+
+def register_generator_callbacks(app):  # type: ignore[arg-type]
+    """Attach all Dash callbacks to *app*. Call this once during startup."""
+
+    # ----------------------- Chat handling -----------------------------------
     @app.callback(
         Output("chat-messages", "children"),
-        [Input("send-btn", "n_clicks"),
-         Input("chat-input", "n_submit")],
-        [State("chat-input", "value"),
-         State("chat-messages", "children"),
-         State("stored-rules", "data")]
+        [Input("send-btn", "n_clicks"), Input("chat-input", "n_submit")],
+        [
+            State("chat-input", "value"),
+            State("chat-messages", "children"),
+            State("stored-rules", "data"),
+        ],
     )
-    def handle_chat_message(n_clicks, n_submit, message, current_messages, stored_rules):
-        if not message or not message.strip():
-            return current_messages
-        
-        # Add user message
-        new_messages = current_messages + [create_chat_message(message, is_user=True)]
-        
-        # Generate bot response
-        bot_response = generate_response(message, stored_rules or [])
-        new_messages.append(create_chat_message(bot_response, is_user=False))
-        
-        return new_messages
+    def _handle_chat_message(
+        _n_clicks: Optional[int],
+        _n_submit: Optional[int],
+        message: Optional[str],
+        messages: List[Any],
+        rules: List[Dict[str, Any]],
+    ) -> List[Any]:
+        """Append user message & model reply to chat history."""
+        if not (message and message.strip()):
+            return messages
 
+        updated = messages + [_create_chat_message(message, is_user=True)]
+        reply = generate_response(message, rules or [])
+        updated.append(_create_chat_message(reply, is_user=False))
+        return updated
+
+    # ----------------------- Clear input after send --------------------------
     @app.callback(
         Output("chat-input", "value"),
-        [Input("send-btn", "n_clicks"),
-         Input("chat-input", "n_submit")],
-        [State("chat-input", "value")]
+        [Input("send-btn", "n_clicks"), Input("chat-input", "n_submit")],
+        State("chat-input", "value"),
     )
-    def clear_input(n_clicks, n_submit, value):
-        if value:
-            return ""
-        return value
+    def _clear_input(_n_clicks: Optional[int], _n_submit: Optional[int], _value: Optional[str]):
+        return ""
 
-    @app.callback(
-        Output("active-rules", "children"),
-        Input("stored-rules", "data")
-    )
-    def render_active_rule_chips(rules):
-        return [create_active_rule_chip(rule) for rule in rules]
+    # ----------------------- Render active rule chips ------------------------
+    @app.callback(Output("active-rules", "children"), Input("stored-rules", "data"))
+    def _render_active_rule_chips(rules: List[Dict[str, Any]]):
+        return [_create_active_rule_chip(r) for r in rules]
 
+    # ----------------------- Update rule store ------------------------------
     @app.callback(
         Output("stored-rules", "data"),
         Input("dropped-rule", "value"),
         State("stored-rules", "data"),
-        prevent_initial_call=True
+        prevent_initial_call=True,
     )
-    def update_stored_rules(new_rule_json, current_rules):
-        if not new_rule_json:
-            raise dash.exceptions.PreventUpdate
-        try:
-            new_rule = json.loads(new_rule_json)
-            if not any(r["id"] == new_rule["id"] for r in current_rules):
-                current_rules.append(new_rule)
-            return current_rules
-        except Exception as e:
-            print("❌ Failed to parse dropped rule:", e)
-            raise dash.exceptions.PreventUpdate
+    def _update_stored_rules(raw_input: Optional[str], rules: List[Dict[str, Any]]):
+        if raw_input is None:
+            raise PreventUpdate
 
-    # Client-side callback for drag and drop functionality
+        try:
+            action = json.loads(raw_input)
+        except json.JSONDecodeError:
+            raise PreventUpdate
+
+        # -- Remove
+        if isinstance(action, dict) and "removeId" in action:
+            print(f"[REMOVE] Rule ID: {action['removeId']}")
+            return [r for r in rules if r.get("id") != action["removeId"]]
+
+        # -- Add
+        if isinstance(action, dict) and "id" in action:
+            if not any(r.get("id") == action["id"] for r in rules):
+                print(f"[ADD] Rule object:\n{json.dumps(action, indent=2)}")
+                return rules + [action]
+            return rules
+
+        raise PreventUpdate
+
+    # ----------------------- One-time JS initialisation ----------------------
     app.clientside_callback(
         """
-        function(id) {
-            const dropZone = document.getElementById('drop-zone');
-            const activeRulesDiv = document.getElementById('active-rules');
-            const input = document.getElementById('dropped-rule');
-            
-            if (!dropZone || !input) return window.dash_clientside.no_update;
+        function (_) {
+            const dropZone   = document.getElementById('drop-zone');
+            const activeDiv  = document.getElementById('active-rules');
+            const hiddenInpt = document.getElementById('dropped-rule');
 
-            // Handle dragover
-            dropZone.addEventListener('dragover', function(e) {
+            if (!dropZone || !hiddenInpt) return false;
+            if (window._ruleGeneratorInitDone) return true;  // already wired
+            window._ruleGeneratorInitDone = true;
+
+            /* Drag-over styling */
+            dropZone.addEventListener('dragover', e => {
                 e.preventDefault();
                 dropZone.classList.add('drag-over');
             });
-            
-            // Handle dragleave
-            dropZone.addEventListener('dragleave', function(e) {
-                dropZone.classList.remove('drag-over');
-            });
-            
-            // Handle drop
-            dropZone.addEventListener('drop', function(e) {
+            dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+
+            /* Drop handler */
+            dropZone.addEventListener('drop', e => {
                 e.preventDefault();
                 dropZone.classList.remove('drag-over');
-                
-                const ruleData = e.dataTransfer.getData('text/plain');
-                if (ruleData) {
-                    try {
-                        const rule = JSON.parse(ruleData);
-                        // Add rule chip to active rules
-                        const chip = document.createElement('span');
-                        chip.className = 'badge bg-light text-dark me-2 mb-2 active-rule-chip';
-                        chip.innerHTML = rule.name + ' <span class="ms-2 remove-rule">×</span>';
-                        activeRulesDiv.appendChild(chip);
+                const txt = e.dataTransfer.getData('text/plain');
+                if (!txt) return;
+                try {
+                    const obj = JSON.parse(txt);
+                    hiddenInpt.setAttribute('value', JSON.stringify(obj));  // attribute -> triggers Dash
+                    hiddenInpt.dispatchEvent(new Event('input', { bubbles: true }));
+                } catch (_) {}
+            });
 
-                        // Update backend store
-                        input.value = JSON.stringify(rule);
-                        input.dispatchEvent(new Event('input', { bubbles: true }));
-                    } catch (e) {
-                        console.error('Error parsing rule data:', e);
-                    }
+            /* Remove rule chip */
+            activeDiv.addEventListener('click', e => {
+                const removeBtn = e.target.closest('.remove-rule');
+                if (!removeBtn) return;
+                const id = e.target.getAttribute('data-rule-id');
+                hiddenInpt.setAttribute('value', JSON.stringify({ removeId: id }));
+                hiddenInpt.dispatchEvent(new Event('input', { bubbles: true }));
+            });
+
+            /* Make external rule cards draggable */
+            document.addEventListener('dragstart', e => {
+                if (!e.target.classList.contains('rule-card')) return;
+                const data = e.target.getAttribute('data-rule');
+                if (data) {
+                    e.dataTransfer.setData('text/plain', data);
                 }
             });
-            
-            // Make rule cards draggable
-            document.addEventListener('dragstart', function(e) {
-                if (e.target.classList.contains('rule-card')) {
-                    const ruleData = e.target.getAttribute('data-rule');
-                    e.dataTransfer.setData('text/plain', ruleData);
-                }
-            });
-            
-            return window.dash_clientside.no_update;
+
+            return true;
         }
         """,
-        Output("drop-zone", "data-initialized"),
+        Output("drop-zone-initialized", "data"),
         Input("drop-zone", "id")
     )

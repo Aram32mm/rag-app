@@ -244,3 +244,23 @@ For questions, issues, or suggestions:
 *Making validation rule management intelligent and intuitive*
 
 </div>
+
+
+| **Column**                | **dtype**       | **Why you want it / how it’s used**                                                          | **Keep?** |
+| ------------------------- | --------------- | -------------------------------------------------------------------------------------------- | --------- |
+| `rule_id` (UID/hash)      | `string`        | Stable primary key—don’t rely on *name* alone.                                               | **✓**     |
+| `rule_name`               | `string`        | Short handle shown to users.                                                                 | **✓**     |
+| `bansta_code`             | `string`        | Domain-specific lookup key.                                                                  | **✓**     |
+| `iso_code`                | `string`        | Same as above.                                                                               | **✓**     |
+| `rule_body`               | `string` (long) | The full formal rule text; fed to the LLM for generation & evaluation.                       | **✓**     |
+| `description_en`          | `string`        | Author-written English summary (v0).                                                         | **✓**     |
+| `description_de`          | `string`        | German counterpart.                                                                          | **✓**     |
+| `llm_description_en`      | `string`        | Latest LLM-generated English summary (v-LLM).                                                | **✓**     |
+| `llm_description_de`      | `string`        | German LLM summary (optional but keeps things symmetric).                                    | optional  |
+| `embedding`               | `object`        | *List\[float]*; same length for all rows—store raw vector or a key into your external index. | **✓**     |
+| `version_major` / `minor` | `int`           | Increment when you change *body* or *logic*; helps trace breakage.                           | optional  |
+| `business_division`       | `category`      | Tag for access control, dashboards, filtering (you said you’ll add this).                    | **✓**     |
+| `function`                | `category`      | Another tag for retrieval clustering & facet filtering.                                      | **✓**     |
+| `tags`                    | `object`        | *List\[str]*; free-form thematic labels (“payments”, “AML”, …).                              | **✓**     |
+| `created_at`              | `datetime64`    | Provenance / analytics.                                                                      | optional  |
+| `updated_at`              | `datetime64`    | Ditto.                                                                                       | optional  |
