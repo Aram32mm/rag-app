@@ -91,7 +91,6 @@ sentence_transformers_cache/
 # Data files
 data/
 dataset/
-*.csv
 *.json
 *.xlsx
 *.xls
