@@ -1,5 +1,5 @@
 """
-rag/generator.py — Model-backed rule chat (skeleton)
+generator.py — Model-backed rule chat (skeleton)
 
 Purpose
 -------
@@ -23,25 +23,14 @@ Dependencies
 from __future__ import annotations
 
 import logging
-import threading
 from typing import Dict, List, Optional, Any
 
-try:
-    from config import (
-        GENERATOR_MESSAGE_WINDOW,
-        GENERATOR_TEMPERATURE,
-        GENERATOR_MAX_TOKENS,
-        GENERATOR_SYSTEM_PROMPT,
-    )
-except Exception:
-    # Safe defaults if config is missing
-    GENERATOR_MESSAGE_WINDOW = 10
-    GENERATOR_TEMPERATURE = 0.7
-    GENERATOR_MAX_TOKENS = 512
-    GENERATOR_SYSTEM_PROMPT = (
-        "You are a helpful assistant for analysing financial validation rules. "
-        "Explain clearly, suggest improvements, and generate new proposals."
-    )
+from config import (
+    GENERATOR_MESSAGE_WINDOW,
+    GENERATOR_TEMPERATURE,
+    GENERATOR_MAX_TOKENS,
+    GENERATOR_SYSTEM_PROMPT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,35 +39,31 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------
 # histories[session_id] = [{"role": "...", "content": "..."}]
 _histories: Dict[str, List[Dict[str, str]]] = {}
-_lock = threading.Lock()
 
 def _ensure_session(session_id: str) -> None:
-    with _lock:
-        if session_id not in _histories:
-            _histories[session_id] = [{"role": "system", "content": GENERATOR_SYSTEM_PROMPT}]
+    if session_id not in _histories:
+        _histories[session_id] = [{"role": "system", "content": GENERATOR_SYSTEM_PROMPT}]
+        logger.debug(f"Created new session: {session_id}")
 
 def _trim_history_inplace(session_id: str) -> None:
-    with _lock:
-        hist = _histories.get(session_id, [])
-        if not hist:
-            return
-        sys = hist[0:1]  # keep system prompt
-        tail = hist[1:]
-        limit = max(0, int(GENERATOR_MESSAGE_WINDOW))
-        if len(tail) > limit:
-            tail = tail[-limit:]
-        _histories[session_id] = sys + tail
+    hist = _histories.get(session_id, [])
+    if not hist:
+        return
+    sys = hist[0:1]  # keep system prompt
+    tail = hist[1:]
+    limit = max(0, int(GENERATOR_MESSAGE_WINDOW))
+    if len(tail) > limit:
+        tail = tail[-limit:]
+    _histories[session_id] = sys + tail
 
 def reset_conversation(session_id: str) -> None:
     """Clear a session's conversation back to only the system prompt."""
-    with _lock:
-        _histories[session_id] = [{"role": "system", "content": GENERATOR_SYSTEM_PROMPT}]
+    _histories[session_id] = [{"role": "system", "content": GENERATOR_SYSTEM_PROMPT}]
     logger.info("Conversation reset for session_id=%s", session_id)
 
 def get_history(session_id: str) -> List[Dict[str, str]]:
     """Return a shallow copy of a session's history."""
-    with _lock:
-        return list(_histories.get(session_id, []))
+    return list(_histories.get(session_id, []))
 
 def _format_rule_context(rules: Optional[List[Dict[str, Any]]]) -> str:
     """Convert active rules into a compact textual context block."""
@@ -116,6 +101,8 @@ def generate_response(
     Returns:
         Assistant reply (string).
     """
+    logger.info(f"generate_response called with message: {user_message[:50]}...")
+    
     if not session_id:
         logger.warning("generate_response called without session_id; using '_default'.")
         session_id = "_default"
@@ -127,22 +114,22 @@ def generate_response(
     _ensure_session(session_id)
     ctx = _format_rule_context(active_rules)
 
-    with _lock:
-        _histories[session_id].append({"role": "user", "content": user_message})
-        _trim_history_inplace(session_id)
+    # Add user message to history
+    _histories[session_id].append({"role": "user", "content": user_message})
+    _trim_history_inplace(session_id)
 
     # -------- STUB IMPLEMENTATION (replace with your model call) -----------
     reply = (
         "This is a placeholder response.\n\n"
         f"{ctx}\n\n"
-        f"You said: “{user_message}”. "
+        f"You said: "{user_message}". "
         "Connect your LLM in 'rag/generator.py' to generate real answers."
     )
     # -----------------------------------------------------------------------
 
-    with _lock:
-        _histories[session_id].append({"role": "assistant", "content": reply})
-        _trim_history_inplace(session_id)
+    # Add assistant reply to history
+    _histories[session_id].append({"role": "assistant", "content": reply})
+    _trim_history_inplace(session_id)
 
     logger.info("Reply generated (stub). session_id=%s, hist_len=%d",
                 session_id, len(_histories.get(session_id, [])))
@@ -175,7 +162,7 @@ def explain_rule(rule: Dict[str, Any]) -> str:
     logger.debug("explain_rule rule_id=%r", rule.get("rule_id"))
     name = rule.get("rule_name", "Unnamed")
     desc = rule.get("rule_description", "No description provided.")
-    return f"Rule “{name}”: {desc}"
+    return f"Rule "{name}": {desc}"
 
 def suggest_improvements(rules: List[Dict[str, Any]]) -> List[str]:
     """Suggest improvements for a set of rules (stub)."""
@@ -187,13 +174,3 @@ def suggest_improvements(rules: List[Dict[str, Any]]) -> List[str]:
         "Add explicit error handling paths.",
         "Include examples and counterexamples in documentation.",
     ]
-
-__all__ = [
-    "generate_response",
-    "reset_conversation",
-    "get_history",
-    "create_new_rule",
-    "modify_rule",
-    "explain_rule",
-    "suggest_improvements",
-]
