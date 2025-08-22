@@ -525,4 +525,4 @@ def register_search_callbacks(app, retriever):
         return True, rows, [0] * len(clicks)
 
 
-__all__ = ["register_search_callbacks", "create_search_component", "make_rule_card"]
+__all__ = ["register_search_callbacks", "create_search_component"]
