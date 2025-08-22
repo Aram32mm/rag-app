@@ -1,5 +1,5 @@
 """
-embedding_manager.py
+manager.py
 
 Provides a manager class for generating high-quality sentence embeddings
 using HuggingFace transformer models. Handles:
@@ -15,6 +15,7 @@ This ensures embeddings are consistent, comparable, and ready for use in retriev
 from typing import List, Union, Optional
 import torch
 import torch.nn.functional as F
+import numpy as np
 from transformers import AutoTokenizer, AutoModel
 
 
@@ -48,6 +49,9 @@ class EmbeddingManager:
         self.tokenizer = None
         self._embedding_cache = {}
 
+    # -----------------------------
+    # Device detection
+    # -----------------------------
     def _get_device(self) -> str:
         """Detect and return the best available device for inference."""
         if torch.backends.mps.is_available():
@@ -57,12 +61,18 @@ class EmbeddingManager:
         else:
             return "cpu"
 
+    # -----------------------------
+    # Model loading
+    # -----------------------------
     def load_model(self):
         """Load the HuggingFace transformer model and tokenizer onto the device."""
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self.model = AutoModel.from_pretrained(self.model_name).to(self.device)
         self.model.eval()
 
+    # -----------------------------
+    # Pooling
+    # -----------------------------
     def _mean_pooling(self, model_output, attention_mask):
         """
         Apply attention-mask-aware mean pooling.
@@ -74,14 +84,19 @@ class EmbeddingManager:
         Returns:
             torch.Tensor: Mean-pooled embeddings of shape [batch, hidden_dim].
         """
-        token_embeddings = model_output.last_hidden_state  # [batch, seq_len, hidden_dim]
-        mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size())
-        sum_embeddings = torch.sum(token_embeddings * mask_expanded, dim=1)
-        sum_mask = mask_expanded.sum(dim=1).clamp(min=1e-9)  # prevent division by zero
-        return sum_embeddings / sum_mask
+        # return sum_embeddings / sum_mask
+        token_embeddings = model_output.last_hidden_state  # [B, T, H]
+        mask = attention_mask.unsqueeze(-1).to(dtype=token_embeddings.dtype)  # [B, T, 1]
+        sum_embeddings = (token_embeddings * mask).sum(dim=1)                 # [B, H]
+        # Count of real tokens per sequence (broadcastable to [B, H])
+        token_counts = mask.sum(dim=1).clamp(min=1e-9)                        # [B, 1]
+        return sum_embeddings / token_counts    
 
+    # -----------------------------
+    # Embedding generation
+    # -----------------------------
     def generate_embeddings(self, texts: Union[str, List[str]], batch_size: int = 32,
-                             use_cache: bool = True) -> torch.Tensor:
+                             use_cache: bool = True) -> np.ndarray:
         """
         Generate embeddings for text(s).
 
@@ -91,7 +106,7 @@ class EmbeddingManager:
             use_cache (bool): Whether to use cache.
 
         Returns:
-            torch.Tensor: L2-normalized embeddings of shape [num_texts, hidden_dim].
+            np.ndarray: L2-normalized embeddings of shape [num_texts, hidden_dim].
         """
         if self.model is None:
             self.load_model()
@@ -106,7 +121,7 @@ class EmbeddingManager:
             uncached = []
             uncached_idx = []
 
-            # check cache
+            # Check cache
             for j, t in enumerate(batch):
                 if use_cache and t in self._embedding_cache:
                     embeddings.append(self._embedding_cache[t])
@@ -115,8 +130,12 @@ class EmbeddingManager:
                     uncached_idx.append(j)
 
             if uncached:
-                encoded = self.tokenizer(uncached, padding=True, truncation=True,
-                                         return_tensors='pt').to(self.device)
+                encoded = self.tokenizer(
+                    uncached,
+                    padding=True,
+                    truncation=True,
+                    return_tensors='pt'
+                ).to(self.device)
 
                 with torch.no_grad():
                     model_output = self.model(**encoded)
@@ -129,4 +148,30 @@ class EmbeddingManager:
                         self._embedding_cache[t] = vec
                     embeddings.append(vec)
 
+        # Convert list[Tensor] → ndarray [N, D]
         return torch.stack(embeddings).numpy()
+
+
+# -----------------------------
+# Sanity check when run directly
+# -----------------------------
+if __name__ == "__main__":
+    import numpy as np
+
+    manager = EmbeddingManager(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+
+    texts = [
+        "The quick brown fox jumps over the lazy dog.",
+        "Artificial intelligence is transforming the world.",
+        "Bananas are yellow and sweet."
+    ]
+
+    embeddings = manager.generate_embeddings(texts)
+
+    print("\n=== EmbeddingManager Sanity Check ===")
+    for i, emb in enumerate(embeddings):
+        norm = np.linalg.norm(emb)
+        print(f"[{i}] shape={emb.shape}, norm={norm:.4f}")
+    print("✅ Embeddings generated and normalized.")

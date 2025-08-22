@@ -1,255 +1,364 @@
 """
-RAG Retriever - Production-ready rule search and retrieval system
+RuleRetriever
+-------------
+
+RuleRetriever with:
+- explicit per-signal scoring (semantic, BM25, fuzzy),
+- per-prompt min-max normalization to [0,1],
+- hybrid scoring with convex weights,
+- candidate pooling utilities,
+- evaluation toggles (reranking placeholder).
+
+Assumptions:
+- SearchConfig with fields:
+    semantic_weight, bm25_weight, fuzzy_weight, min_similarity, enable_reranking
+- SearchMode enum with SEMANTIC, KEYWORD, FUZZY, HYBRID
+- RuleDataLoader loads `self.rules` as list[dict], each rule has at least:
+    {"rule_id", "name", "keywords", ...}
+- EmbeddingManager + EmbeddingIndex for semantic search
+- DatabaseManager to load rules
+- Dependencies: numpy, rank_bm25, fuzzywuzzy
 """
 
-import numpy as np
-import pandas as pd
-from typing import List, Dict, Optional, Union, Tuple
-from dataclasses import dataclass
-from enum import Enum
+from typing import List, Dict, Optional
 import logging
-from pathlib import Path
-from sklearn.metrics.pairwise import cosine_similarity
-from rank_bm25 import BM25Okapi
-from fuzzywuzzy import fuzz
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
-from .embeddings import EmbeddingManager, EmbeddingIndex
+from fuzzywuzzy import fuzz
+from rank_bm25 import BM25Okapi
+
+# Project-local imports
+from base import SearchConfig, SearchMode
+from data import RuleDataLoader
+from manager import EmbeddingManager
+from index import EmbeddingIndex
+from db.manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
 
-class SearchMode(Enum):
-    SEMANTIC = "semantic"
-    KEYWORD = "keyword"
-    HYBRID = "hybrid"
-    FUZZY = "fuzzy"
-
-
-@dataclass
-class SearchConfig:
-    semantic_weight: float = 0.6
-    bm25_weight: float = 0.3
-    fuzzy_weight: float = 0.1
-    min_similarity: float = 0.1
-    max_results: int = 50
-    enable_reranking: bool = True
-
 class RuleRetriever:
-    CSV_COLUMNS = {
-        'rule_id': 'id',
-        'rule_name': 'name',
-        'rule_description': 'description',
-        'bansta_code': 'bansta_code',
-        'iso_code': 'iso_code',
-        'business_division': 'division',
-        'function': 'function',
-        'tags': 'tags',
-        'rule_body': 'rule_body',
-        'english_description': 'description_en',
-        'german_description': 'description_de',
-        'llm_description_en': 'llm_description_en',
-        'llm_description_de': 'llm_description_de',
-        'embedding': 'embedding',
-        'version_major': 'version_major',
-        'version_minor': 'version_minor',
-        'created_at': 'created_at',
-        'updated_at': 'updated_at'
-    }
+    """
+    Hybrid retriever for compliance rules.
 
-    def __init__(self,
-                 embedding_manager: Optional[EmbeddingManager] = None,
-                 config: Optional[SearchConfig] = None):
+    Supports:
+    - Pure semantic search (dense embeddings)
+    - Pure keyword search (BM25)
+    - Pure fuzzy search (token-set / name match)
+    - Hybrid (convex combination of normalized signals)
+
+    Also supports candidate pooling and reranking hooks.
+    """
+
+    def __init__(
+        self,
+        embedding_manager: Optional[EmbeddingManager] = None,
+        config: Optional[SearchConfig] = None,
+        db_manager: Optional[DatabaseManager] = None,
+    ):
+        """
+        Initialize retriever.
+
+        Args:
+            embedding_manager: Manages embedding model and normalization.
+            config: SearchConfig with weights, thresholds, toggles.
+            db_manager: DatabaseManager to fetch rules.
+        """
         self.embedding_manager = embedding_manager or EmbeddingManager()
         self.config = config or SearchConfig()
-        self.rules_df = None
-        self.embedding_index = None
-        self.bm25_index = None
-        self._rules_cache = {}
+        self.data_loader = RuleDataLoader(db_manager)
+        self.rules: List[dict] = self.data_loader.rules
 
-    def load_rules(self, filepath: str):
-        path = Path(filepath)
-        if path.suffix != ".csv":
-            raise ValueError("Only CSV files are supported")
+        # Indices (semantic + keyword)
+        self.embedding_index: Optional[EmbeddingIndex] = None
+        self.bm25_index: Optional[BM25Okapi] = None
+        self._bm25_keywords_len: int = 0
 
-        df = pd.read_csv(filepath)
-        self.rules_df = self._standardize_dataframe(df)
+        # Metadata filters (for UI faceting)
+        self.filter_options: Optional[Dict[str, List[str]]] = None
+
+        if not self.rules:
+            logger.error("No rules loaded from the database. Please check your data source.")
+            raise ValueError("No rules loaded from the database. Please check your data source.")
+
         self._build_indices()
-        logger.info(f"Loaded {len(self.rules_df)} rules from {filepath}")
+        self._build_filter_options()
 
-    def _standardize_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        df.columns = df.columns.str.strip()
-        df = df.rename(columns={k: v for k, v in self.CSV_COLUMNS.items() if k in df.columns})
-
-        for col in ["id", "name", "description", "category"]:
-            if col not in df.columns:
-                df[col] = "unknown"
-
-        if "priority" not in df.columns:
-            df["priority"] = "medium"
-
-        if "id" not in df.columns or df["id"].isnull().any():
-            df["id"] = [f"rule_{i}" for i in range(len(df))]
-
-        df["name"] = df["name"].astype(str).fillna("")
-        df["description"] = df["description"].astype(str).fillna("")
-
-        return df
-
+    # -----------------------------
+    # Index building
+    # -----------------------------
     def _build_indices(self):
-        rules_list = self.rules_df.to_dict("records")
-        self.embedding_index = EmbeddingIndex(self.embedding_manager)
-        self.embedding_index.add_rules(rules_list)
+        """Build semantic and BM25 indices in parallel."""
+        def build_embedding_index():
+            logger.info("Building embedding index...")
+            self.embedding_index = EmbeddingIndex(self.embedding_manager)
+            self.embedding_index.add_rules(self.rules)
+            logger.info("Embedding index built successfully.")
 
-        documents = [
-            f"{row['name']} {row['description']}".lower().split()
-            for _, row in self.rules_df.iterrows()
-        ]
-        self.bm25_index = BM25Okapi(documents)
-        logger.info("Built search indices")
+        def build_bm25_index():
+            logger.info("Building BM25 index...")
+            corpus = [r.get("keywords", "") for r in self.rules]
+            tokenized = [kw.replace(",", " ").split() if kw else [] for kw in corpus]
 
+            if not tokenized or all(len(toks) == 0 for toks in tokenized):
+                self.bm25_index = None
+                self._bm25_keywords_len = 0
+                logger.warning("BM25 index not built due to empty/invalid keywords.")
+            else:
+                self.bm25_index = BM25Okapi(tokenized)
+                self._bm25_keywords_len = len(tokenized)
+                logger.info("BM25 index built successfully.")
+
+        # Run in parallel threads
+        with ThreadPoolExecutor() as exe:
+            futures = [exe.submit(build_embedding_index), exe.submit(build_bm25_index)]
+            for f in futures:
+                f.result()  # rethrow exceptions if any
+
+    def _build_filter_options(self) -> Dict[str, List[str]]:
+        """
+        Precompute filter option values for UI drop-downs.
+        Extracts unique values of fields (rule_type, country, etc.).
+        """
+        def flatten_unique(field):
+            tags = set()
+            for r in self.rules:
+                vals = r.get(field, [])
+                if isinstance(vals, (list, set, tuple)):
+                    tags.update(vals)
+                elif vals:
+                    tags.add(vals)
+            return sorted(tags)
+
+        self.filter_options = {
+            "rule_type": flatten_unique("rule_type"),
+            "country": flatten_unique("country"),
+            "business_type": flatten_unique("business_type"),
+            "party_agent": flatten_unique("party_agent"),
+        }
+        return self.filter_options
+
+    # -----------------------------
+    # Public API
+    # -----------------------------
     def search_rules(
         self,
         query: Optional[str] = None,
-        division: Optional[str] = None,
-        priority: Optional[str] = None,
-        function: Optional[str] = None,
-        tags: Optional[Union[str, List[str]]] = None,
+        rule_type: Optional[List[str]] = None,
+        country: Optional[List[str]] = None,
+        business_type: Optional[List[str]] = None,
+        party_agent: Optional[List[str]] = None,
         mode: SearchMode = SearchMode.HYBRID,
-        top_k: int = 10
-    ) -> pd.DataFrame:
-        if self.rules_df is None:
-            raise ValueError("No rules loaded. Call load_rules() first.")
+        top_k: int = 10,
+    ) -> List[dict]:
+        """
+        Main search entrypoint.
 
-        df = self.rules_df.copy()
+        Args:
+            query: User query string.
+            rule_type, country, business_type, party_agent: Optional filters.
+            mode: SearchMode (semantic, keyword, fuzzy, or hybrid).
+            top_k: Return top-k results.
 
-        if division:
-            df = df[df["division"].str.lower() == division.lower()]
-
-        if priority:
-            df = df[df["priority"].str.lower() == priority.lower()]
-
-        if function:
-            df = df[df["function"].str.lower() == function.lower()]
-
-        if tags:
-            if isinstance(tags, str):
-                tags = [tags]
-            df = df[df["tags"].apply(lambda tag_str: any(tag.lower() in tag_str.lower() for tag in tags if isinstance(tag_str, str)))]
-
-        if not query:
-            return df.head(top_k)
-
-        if mode == SearchMode.SEMANTIC:
-            scores = self._semantic_search(query, df)
-        elif mode == SearchMode.KEYWORD:
-            scores = self._keyword_search(query, df)
-        elif mode == SearchMode.FUZZY:
-            scores = self._fuzzy_search(query, df)
-        else:
-            scores = self._hybrid_search(query, df)
-
-        df = df.copy()
-        df["search_score"] = scores
-        df = df[df["search_score"] >= self.config.min_similarity]
-
-        if self.config.enable_reranking and len(df) > top_k:
-            df = self._rerank_results(query, df, top_k)
-
-        return df.sort_values("search_score", ascending=False).head(top_k)
-
-    def _semantic_search(self, query: str, df: pd.DataFrame) -> np.ndarray:
-        query_emb = self.embedding_manager.generate_embeddings(query)[0]
-        embeddings = [
-            self.embedding_manager.generate_embeddings(f"{row['name']} {row['description']}")[0]
-            for _, row in df.iterrows()
-        ]
-        return cosine_similarity([query_emb], embeddings)[0] if embeddings else np.array([])
-
-    def _keyword_search(self, query: str, df: pd.DataFrame) -> np.ndarray:
-        documents = [
-            f"{row['name']} {row['description']}".lower().split()
-            for _, row in df.iterrows()
-        ]
-        bm25 = BM25Okapi(documents)
-        scores = bm25.get_scores(query.lower().split())
-        max_score = max(scores) if max(scores) > 0 else 1
-        return np.array(scores) / max_score
-
-    def _fuzzy_search(self, query: str, df: pd.DataFrame) -> np.ndarray:
-        return np.array([
-            max(
-                fuzz.partial_ratio(query.lower(), f"{row['name']} {row['description']}".lower()),
-                fuzz.token_sort_ratio(query.lower(), f"{row['name']} {row['description']}".lower())
-            ) / 100.0
-            for _, row in df.iterrows()
-        ])
-
-    def _hybrid_search(self, query: str, df: pd.DataFrame) -> np.ndarray:
-        sem = self._semantic_search(query, df)
-        kwd = self._keyword_search(query, df)
-        fzy = self._fuzzy_search(query, df)
-        return (
-            self.config.semantic_weight * sem +
-            self.config.bm25_weight * kwd +
-            self.config.fuzzy_weight * fzy
+        Returns:
+            List of rule dicts with "search_score" attached.
+        """
+        rules = self._apply_filters(
+            self.rules, rule_type=rule_type, country=country, business_type=business_type, party_agent=party_agent
         )
+        if not rules:
+            return []
 
-    def _rerank_results(self, query: str, df: pd.DataFrame, top_k: int) -> pd.DataFrame:
-        rerank_df = df.head(top_k * 2).copy()
-        rerank_scores = []
+        # If no query, return filtered rules directly
+        if not query:
+            return rules[:top_k]
 
-        for _, row in rerank_df.iterrows():
-            score = row["search_score"]
-            if query.lower() in row["name"].lower():
-                score *= 1.2
-            if row["priority"].lower() == "high":
-                score *= 1.1
-            if len(row["description"]) < 50:
-                score *= 0.9
-            rerank_scores.append(score)
+        # Select scoring function
+        if mode == SearchMode.SEMANTIC:
+            scores = self._semantic_scores(query, rules)
+        elif mode == SearchMode.KEYWORD:
+            scores = self._bm25_scores(query, rules)
+        elif mode == SearchMode.FUZZY:
+            scores = self._fuzzy_scores(query, rules)
+        else:
+            scores = self._hybrid_scores(query, rules)
 
-        rerank_df["rerank_score"] = rerank_scores
-        return rerank_df.sort_values("rerank_score", ascending=False)
+        # Convert dict → aligned list
+        scores_vec = [scores.get(r["rule_id"], 0.0) for r in rules]
 
-    def get_rule_by_id(self, rule_id: str) -> Optional[Dict]:
-        if rule_id in self._rules_cache:
-            return self._rules_cache[rule_id]
-        if self.rules_df is None:
-            return None
-        match = self.rules_df[self.rules_df["id"] == rule_id]
-        if match.empty:
-            return None
-        rule_data = match.iloc[0].to_dict()
-        self._rules_cache[rule_id] = rule_data
-        return rule_data
+        # Apply similarity threshold filter
+        results = [dict(r, search_score=s) for r, s in zip(rules, scores_vec) if s >= self.config.min_similarity]
+        results.sort(key=lambda r: r["search_score"], reverse=True)
 
-    def get_similar_rules(
-        self, rule_text: str, top_k: int = 5, exclude_ids: Optional[List[str]] = None
-    ) -> List[Tuple[Dict, float]]:
-        if self.embedding_index is None:
-            raise ValueError("No embedding index available")
-        results = self.embedding_index.search(rule_text, top_k * 2)
-        if exclude_ids:
-            results = [(rule, score) for rule, score in results if rule.get("id") not in exclude_ids]
+        # Optional rerank stage
+        if self.config.enable_reranking and len(results) > top_k:
+            results = self._rerank_results(query, results, top_k)
+
         return results[:top_k]
 
-    def update_rule_index(self, new_rules: Optional[List[Dict]] = None):
-        if new_rules:
-            new_df = pd.DataFrame(new_rules)
-            self.rules_df = pd.concat([self.rules_df, new_df], ignore_index=True)
-            self.rules_df.drop_duplicates(subset="id", keep="last", inplace=True)
-        self._build_indices()
-        self._rules_cache.clear()
-        logger.info("Updated search indices")
+    # -----------------------------
+    # Filtering
+    # -----------------------------
+    @staticmethod
+    def _to_list(val) -> List[str]:
+        """Ensure filters are always lists."""
+        if val is None:
+            return []
+        if isinstance(val, (list, set, tuple)):
+            return list(val)
+        return [val]
 
-    def get_search_statistics(self) -> Dict:
-        if self.rules_df is None:
-            return {}
-        return {
-            "total_rules": len(self.rules_df),
-            "categories": self.rules_df["category"].value_counts().to_dict(),
-            "priorities": self.rules_df["priority"].value_counts().to_dict(),
-            "avg_description_length": self.rules_df["description"].str.len().mean(),
-            "has_embedding_index": self.embedding_index is not None,
-            "has_bm25_index": self.bm25_index is not None
+    def _apply_filters(
+        self,
+        rules: List[dict],
+        rule_type: Optional[List[str]] = None,
+        country: Optional[List[str]] = None,
+        business_type: Optional[List[str]] = None,
+        party_agent: Optional[List[str]] = None,
+    ) -> List[dict]:
+        """Filter rules by rule_type, country, business_type, party_agent."""
+        filters = {
+            "rule_type": self._to_list(rule_type),
+            "country": self._to_list(country),
+            "business_type": self._to_list(business_type),
+            "party_agent": self._to_list(party_agent),
         }
+        out = rules
+        for field, selected in filters.items():
+            if selected:
+                sel = set(selected)
+                out = [r for r in out if set(r.get(field, [])) & sel]
+        return out
+
+    # -----------------------------
+    # Per-signal scoring
+    # -----------------------------
+    def _semantic_scores(self, query: str, rules: List[dict]) -> Dict[str, float]:
+        """
+        Semantic search: cosine similarity between query embedding and rule embeddings.
+        Returns raw cosine scores (before normalization).
+        """
+        if self.embedding_index is None:
+            return {r["rule_id"]: 0.0 for r in rules}
+
+        results = self.embedding_index.search(query, top_k=len(rules))
+        by_id = {r["rule_id"]: float(score) for r, score in results}
+
+        return {r["rule_id"]: by_id.get(r["rule_id"], 0.0) for r in rules}
+
+    def _bm25_scores(self, query: str, rules: List[dict]) -> Dict[str, float]:
+        """
+        BM25 search: keyword relevance from extracted keywords field.
+        May produce negative or unbounded scores → requires normalization.
+        """
+        if self.bm25_index is None or self._bm25_keywords_len == 0:
+            return {r["rule_id"]: 0.0 for r in rules}
+
+        q_tokens = query.replace(",", " ").split()
+        scores = self.bm25_index.get_scores(q_tokens)
+
+        id_to_pos = {r["rule_id"]: i for i, r in enumerate(self.rules)}
+        out = {}
+        for r in rules:
+            pos = id_to_pos.get(r["rule_id"], None)
+            out[r["rule_id"]] = float(scores[pos]) if pos is not None else 0.0
+        return out
+
+    def _fuzzy_scores(self, query: str, rules: List[dict]) -> Dict[str, float]:
+        """
+        Fuzzy search: partial ratio string similarity on rule names.
+        Normalized to [0,1].
+        """
+        out = {}
+        for r in rules:
+            name = r.get("name", "") or ""
+            out[r["rule_id"]] = float(fuzz.partial_ratio(query.lower(), name.lower())) / 100.0
+        return out
+
+    # -----------------------------
+    # Normalization & hybrid
+    # -----------------------------
+    @staticmethod
+    def _normalize_per_prompt(scores: Dict[str, float]) -> Dict[str, float]:
+        """
+        Normalize scores for one query across candidate rules.
+        Uses min-max scaling to [0,1] to prevent negative BM25 scores
+        from leaking through.
+
+        If all values are identical → collapse to 0.0.
+        """
+        if not scores:
+            return scores
+        vals = list(scores.values())
+        mn, mx = min(vals), max(vals)
+
+        if mx == mn:
+            return {k: 0.0 for k in scores}
+
+        return {k: (v - mn) / (mx - mn) for k, v in scores.items()}
+
+    def _hybrid_scores(self, query: str, rules: List[dict]) -> Dict[str, float]:
+        """
+        Hybrid scoring:
+        - Normalize each signal per prompt (semantic, BM25, fuzzy).
+        - Combine with convex weights from config.
+        - If all weights = 0 → fallback to uniform weights.
+        """
+        sem = self._normalize_per_prompt(self._semantic_scores(query, rules))
+        bm25 = self._normalize_per_prompt(self._bm25_scores(query, rules))
+        fz = self._normalize_per_prompt(self._fuzzy_scores(query, rules))
+
+        # Guard against zero or negative weights
+        w_sem = max(self.config.semantic_weight, 0.0)
+        w_kw = max(self.config.bm25_weight, 0.0)
+        w_fz = max(self.config.fuzzy_weight, 0.0)
+        sw = w_sem + w_kw + w_fz
+
+        if sw == 0:
+            w_sem = w_kw = w_fz = 1.0 / 3.0
+            sw = 1.0
+
+        w_sem, w_kw, w_fz = w_sem / sw, w_kw / sw, w_fz / sw
+
+        out = {}
+        for r in rules:
+            rid = r["rule_id"]
+            out[rid] = (
+                w_sem * sem.get(rid, 0.0)
+                + w_kw * bm25.get(rid, 0.0)
+                + w_fz * fz.get(rid, 0.0)
+            )
+        return out
+
+    # -----------------------------
+    # Candidate pooling utilities
+    # -----------------------------
+    def candidate_pool(self, query: str, k_each: int = 20) -> List[dict]:
+        """
+        Return candidate set = union of top-k from each signal.
+        Useful for evaluation or reranking pipelines.
+        """
+        sem_ids = self._top_k_ids(self._semantic_scores(query, self.rules), k_each)
+        bm_ids = self._top_k_ids(self._bm25_scores(query, self.rules), k_each)
+        fz_ids = self._top_k_ids(self._fuzzy_scores(query, self.rules), k_each)
+
+        pool_ids = list(dict.fromkeys(sem_ids + bm_ids + fz_ids))  # preserve order
+        id_to_rule = {r["rule_id"]: r for r in self.rules}
+        return [id_to_rule[rid] for rid in pool_ids if rid in id_to_rule]
+
+    @staticmethod
+    def _top_k_ids(score_dict: Dict[str, float], k: int) -> List[str]:
+        """Helper: return top-k rule_ids sorted by score descending."""
+        return [rid for rid, _ in sorted(score_dict.items(), key=lambda kv: kv[1], reverse=True)[:k]]
+
+    # -----------------------------
+    # Reranking placeholder
+    # -----------------------------
+    def _rerank_results(self, query: str, results: List[dict], top_k: int) -> List[dict]:
+        """
+        Optional reranker.
+        Currently passthrough: returns top_k results as-is.
+        Replace with cross-encoder or LLM reranker if needed.
+        """
+        return results[:top_k]

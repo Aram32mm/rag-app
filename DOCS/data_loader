@@ -1,0 +1,122 @@
+"""
+data.py — Rule data loader
+
+Purpose
+-------
+Load rules from SQLite via DatabaseManager and normalize fields (tags, embeddings)
+into a convenient in-memory structure.
+
+Key Responsibilities
+--------------------
+- Fetch rows from the rules table.
+- Split comma-separated tag fields into lists.
+- Parse JSON-encoded embeddings if present.
+- Expose `rules: List[dict]` for search components.
+
+Dependencies
+------------
+- json
+- db.manager.DatabaseManager
+- typing
+"""
+
+
+import json
+import logging
+from typing import Optional, List, Dict, Any
+from db.manager import DatabaseManager
+
+logger = logging.getLogger(__name__)
+
+
+class RuleDataLoader:
+    """
+    RuleDataLoader
+    --------------
+    Loads rule data from the database and transforms it into
+    a normalized format suitable for search/retrieval.
+
+    Transformations applied:
+    - Tag fields split into lists.
+    - Embeddings parsed from JSON strings.
+    - Missing/invalid values replaced with safe defaults.
+    """
+
+    def __init__(self, db_manager: Optional[DatabaseManager] = None):
+        """
+        Initialize the RuleDataLoader.
+
+        Args:
+            db_manager (DatabaseManager, optional): Database manager instance.
+                                                    If None, a default is created.
+        """
+        self.db_manager = db_manager or DatabaseManager()
+        self.rules: List[Dict[str, Any]] = []
+        logger.info("Initializing RuleDataLoader...")
+        self.load_rules()
+
+    # -----------------------------
+    # Data loading
+    # -----------------------------
+    def load_rules(self) -> List[Dict[str, Any]]:
+        """
+        Load and normalize rules from the database.
+
+        Returns:
+            List[Dict[str, Any]]: List of normalized rule dictionaries.
+        """
+        columns = [
+            "rule_id", "rule_name", "rule_description", "bansta_error_code",
+            "iso_error_code", "description_en", "description_de", "rule_code",
+            "llm_description", "keywords", "rule_type", "country",
+            "business_type", "party_agent", "embedding", "relevance",
+            "version_major", "version_minor", "created_at", "updated_at",
+        ]
+        tag_fields = ["rule_type", "country", "business_type", "party_agent"]
+
+        logger.info("Fetching rules from database...")
+        try:
+            rows = self.db_manager.get_rules()
+        except Exception as e:
+            logger.error(f"Failed to fetch rules from database: {e}")
+            self.rules = []
+            return self.rules
+
+        if not rows:
+            logger.warning("No rules found in database.")
+            self.rules = []
+            return self.rules
+
+        self.rules = []
+        for idx, row in enumerate(rows, start=1):
+            rule = dict(zip(columns, row))
+
+            # -----------------------------
+            # Handle tag fields (split strings -> list of values)
+            # -----------------------------
+            for field in tag_fields:
+                value = rule.get(field)
+                if value and isinstance(value, str):
+                    rule[field] = [v.strip() for v in value.split(",") if v.strip()]
+                else:
+                    rule[field] = []
+
+            # -----------------------------
+            # Handle embedding field (JSON string -> list of floats)
+            # -----------------------------
+            emb_val = rule.get("embedding")
+            if emb_val and isinstance(emb_val, str):
+                try:
+                    rule["embedding"] = json.loads(emb_val)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        f"Rule {rule.get('rule_id')} has invalid embedding JSON. Replacing with empty list."
+                    )
+                    rule["embedding"] = []
+            else:
+                rule["embedding"] = []
+
+            self.rules.append(rule)
+
+        logger.info(f"Successfully loaded and normalized {len(self.rules)} rules.")
+        return self.rules
