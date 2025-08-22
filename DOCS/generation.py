@@ -25,14 +25,13 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
-from dash import Input, Output, State, dcc, html
+from dash import Input, Output, State, dcc, html, no_update
 import dash_bootstrap_components as dbc
 from dash.exceptions import PreventUpdate
 from dash_iconify import DashIconify
 
-# Local import – function that talks to your language-model backend
+# Local import – function that talks to your language-model backend (stubbed)
 from rag.generator import generate_response
-
 
 # ----------------------------------------------------------------------------
 # UI FACTORIES
@@ -53,7 +52,8 @@ def create_generator_component() -> dbc.Card:
             # ---------- Body ----------------------------------------------------
             dbc.CardBody(
                 [
-                    # Stores / hidden input ----------------------------------
+                    # Session + stores / hidden inputs -------------------------
+                    dcc.Store(id="session-id"),  # set via clientside UUID on load
                     dcc.Store(id="stored-rules", data=[]),
                     dcc.Input(id="dropped-rule", type="text", style={"display": "none"}),
                     dcc.Store(id="drop-zone-initialized", data=False),
@@ -107,7 +107,6 @@ def create_generator_component() -> dbc.Card:
         className="h-100 generator-card",
     )
 
-
 # ----------------------------------------------------------------------------
 # Helper builders (private)
 # ----------------------------------------------------------------------------
@@ -125,7 +124,6 @@ def _create_active_rule_chip(rule: Dict[str, Any]) -> dbc.Badge:
         className="me-2 mb-2 active-rule-chip",
     )
 
-
 def _create_chat_message(content: str, *, is_user: bool = True) -> html.Div:
     """Return a styled chat bubble for user or bot messages."""
     icon_name = "mdi:account" if is_user else "mdi:robot"
@@ -136,13 +134,30 @@ def _create_chat_message(content: str, *, is_user: bool = True) -> html.Div:
         className=f"chat-message {class_name}",
     )
 
-
 # ----------------------------------------------------------------------------
 # Callback registration (public)
 # ----------------------------------------------------------------------------
 
 def register_generator_callbacks(app):  # type: ignore[arg-type]
     """Attach all Dash callbacks to app. Call this once during startup."""
+
+    # ----------------------- Assign per-tab UUID session ---------------------
+    # Create a unique session-id (per browser tab) on first render.
+    app.clientside_callback(
+        """
+        function(_) {
+            // Only generate once per tab
+            if (window._sessionId) return window._sessionId;
+            // Simple RFC4122-ish v4 generator
+            const s4 = () => Math.floor((1 + Math.random()) * 0x10000).toString(16).substring(1);
+            const uuid = () => `${s4()}${s4()}-${s4()}-${s4()}-${s4()}-${s4()}${s4()}${s4()}`;
+            window._sessionId = uuid();
+            return window._sessionId;
+        }
+        """,
+        Output("session-id", "data"),
+        Input("drop-zone", "id"),
+    )
 
     # ----------------------- Chat handling -----------------------------------
     @app.callback(
@@ -152,7 +167,9 @@ def register_generator_callbacks(app):  # type: ignore[arg-type]
             State("chat-input", "value"),
             State("chat-messages", "children"),
             State("stored-rules", "data"),
+            State("session-id", "data"),
         ],
+        prevent_initial_call=True,
     )
     def _handle_chat_message(
         _n_clicks: Optional[int],
@@ -160,13 +177,17 @@ def register_generator_callbacks(app):  # type: ignore[arg-type]
         message: Optional[str],
         messages: List[Any],
         rules: List[Dict[str, Any]],
+        session_id: Optional[str],
     ) -> List[Any]:
-        """Append user message & model reply to chat history."""
+        """Append user message & model reply to chat history (session-scoped)."""
+        if not session_id:
+            # Extremely rare: no session yet; ignore this turn
+            return messages or []
         if not (message and message.strip()):
-            return messages
+            return messages or []
 
-        updated = messages + [_create_chat_message(message, is_user=True)]
-        reply = generate_response(message, rules or [])
+        updated = (messages or []) + [_create_chat_message(message, is_user=True)]
+        reply = generate_response(message, rules or [], session_id=session_id)
         updated.append(_create_chat_message(reply, is_user=False))
         return updated
 
@@ -175,6 +196,7 @@ def register_generator_callbacks(app):  # type: ignore[arg-type]
         Output("chat-input", "value"),
         [Input("send-btn", "n_clicks"), Input("chat-input", "n_submit")],
         State("chat-input", "value"),
+        prevent_initial_call=True,
     )
     def _clear_input(_n_clicks: Optional[int], _n_submit: Optional[int], _value: Optional[str]):
         return ""
@@ -182,7 +204,7 @@ def register_generator_callbacks(app):  # type: ignore[arg-type]
     # ----------------------- Render active rule chips ------------------------
     @app.callback(Output("active-rules", "children"), Input("stored-rules", "data"))
     def _render_active_rule_chips(rules: List[Dict[str, Any]]):
-        return [_create_active_rule_chip(r) for r in rules]
+        return [_create_active_rule_chip(r) for r in (rules or [])]
 
     # ----------------------- Update rule store -------------------------------
     @app.callback(
@@ -202,14 +224,14 @@ def register_generator_callbacks(app):  # type: ignore[arg-type]
 
         # -- Remove
         if isinstance(action, dict) and "removeId" in action:
-            print(f"[REMOVE] Rule ID: {action['removeId']}")
-            return [r for r in rules if r.get("rule_id") != action["removeId"]]
+            rid = action["removeId"]
+            return [r for r in (rules or []) if r.get("rule_id") != rid]
 
         # -- Add
         if isinstance(action, dict) and "rule_id" in action:
             rule_id = action["rule_id"]
+            rules = rules or []
             if not any(r.get("rule_id") == rule_id for r in rules):
-                print(f"[ADD] Rule object:\n{json.dumps(action, indent=2)}")
                 return rules + [action]
             return rules
 
@@ -251,7 +273,8 @@ def register_generator_callbacks(app):  # type: ignore[arg-type]
             activeDiv.addEventListener('click', e => {
                 const removeBtn = e.target.closest('.remove-rule');
                 if (!removeBtn) return;
-                const id = e.target.getAttribute('data-rule-id');
+                const id = removeBtn.getAttribute('data-rule-id');
+                if (!id) return;
                 hiddenInpt.setAttribute('value', JSON.stringify({ removeId: id }));
                 hiddenInpt.dispatchEvent(new Event('input', { bubbles: true }));
             });
