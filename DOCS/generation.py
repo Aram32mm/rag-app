@@ -177,16 +177,32 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
     app.clientside_callback(
         """
         function(_) {
-            // Always generate a fresh per-tab UUID (no browser storage).
-            if (window._tabSessionId) return window._tabSessionId;
-
-            let id = (crypto && crypto.randomUUID) ? crypto.randomUUID() : null;
-            if (!id) {
-                const s4 = () => Math.floor((1 + Math.random()) * 0x10000).toString(16).substring(1);
-                id = `${s4()}${s4()}-${s4()}-${s4()}-${s4()}-${s4()}${s4()}${s4()}`;
+            // Try per-tab sessionStorage first (persists across reloads in the same tab)
+            try {
+                let id = sessionStorage.getItem("chatbot_tab_session_id");
+                if (!id) {
+                    // Use secure random if available, else fallback to a uuid-ish function
+                    if (window.crypto && crypto.randomUUID) {
+                        id = crypto.randomUUID();
+                    } else {
+                        const s4 = () => Math.floor((1 + Math.random()) * 0x10000).toString(16).substring(1);
+                        id = `${s4()}${s4()}-${s4()}-${s4()}-${s4()}-${s4()}${s4()}${s4()}`;
+                    }
+                    sessionStorage.setItem("chatbot_tab_session_id", id);
+                }
+                return id;
+            } catch (e) {
+                // If sessionStorage is blocked, fall back to an in-memory id (lost on reload)
+                if (!window._tabSessionId) {
+                    if (window.crypto && crypto.randomUUID) {
+                        window._tabSessionId = crypto.randomUUID();
+                    } else {
+                        const s4 = () => Math.floor((1 + Math.random()) * 0x10000).toString(16).substring(1);
+                        window._tabSessionId = `${s4()}${s4()}-${s4()}-${s4()}-${s4()}-${s4()}${s4()}${s4()}`;
+                    }
+                }
+                return window._tabSessionId;
             }
-            window._tabSessionId = id;
-            return id;
         }
         """,
         Output("session-id", "data"),
