@@ -24,9 +24,10 @@ from __future__ import annotations
 
 import json
 import logging
+from time import time
 from typing import Any, Dict, List, Optional
 
-from dash import Input, Output, State, dcc, html, no_update
+from dash import Input, Output, State, dcc, html
 import dash_bootstrap_components as dbc
 from dash.exceptions import PreventUpdate
 from dash_iconify import DashIconify
@@ -35,6 +36,7 @@ from dash_iconify import DashIconify
 from rag.generator import generate_response
 
 logger = logging.getLogger(__name__)
+
 
 # ----------------------------------------------------------------------------
 # UI FACTORIES
@@ -55,10 +57,11 @@ def create_chatbot_component() -> dbc.Card:
             dbc.CardBody(
                 [
                     # Session + stores / hidden inputs -------------------------
-                    dcc.Store(id="session-id"),  # set via clientside UUID on load
+                    dcc.Store(id="session-id"),  # set via clientside UUID on load (localStorage-backed)
                     dcc.Store(id="stored-rules", data=[]),
                     dcc.Input(id="dropped-rule", type="text", style={"display": "none"}),
                     dcc.Store(id="drop-zone-initialized", data=False),
+                    dcc.Store(id="response-trigger", data=None),
 
                     # Drop-zone ------------------------------------------------
                     html.Div(
@@ -73,7 +76,7 @@ def create_chatbot_component() -> dbc.Card:
                     # Active rule chips ---------------------------------------
                     html.Div(id="active-rules", className="mb-3"),
 
-                    # Chat interface -----------------------------------------
+                    # Chat interface ------------------------------------------
                     html.Div(
                         [
                             html.Div(
@@ -89,13 +92,14 @@ def create_chatbot_component() -> dbc.Card:
                             ),
                             dbc.InputGroup(
                                 [
-                                    # IMPORTANT: use dcc.Input so Enter/return triggers n_submit
+                                    # Use dcc.Input so Enter triggers n_submit
                                     dcc.Input(
                                         id="chat-input",
                                         placeholder="Ask me about rules, or request new ones…",
                                         type="text",
                                         debounce=False,
-                                        className="chat-input form-control",  # form-control to keep styling inside InputGroup
+                                        n_submit=0,
+                                        className="chat-input form-control",
                                     ),
                                     dbc.Button(
                                         DashIconify(icon="mdi:send", width=20),
@@ -112,6 +116,7 @@ def create_chatbot_component() -> dbc.Card:
         ],
         className="h-100 chatbot-card",
     )
+
 
 # ----------------------------------------------------------------------------
 # Helper builders (private)
@@ -130,14 +135,29 @@ def _create_active_rule_chip(rule: Dict[str, Any]) -> dbc.Badge:
         className="me-2 mb-2 active-rule-chip",
     )
 
-def _create_chat_message(content: str, *, is_user: bool = True) -> html.Div:
-    """Return a styled chat bubble for user or bot messages."""
+
+def _create_chat_message(content: str, *, is_user: bool = True, is_loading: bool = False) -> html.Div:
+    """Return a styled chat bubble for user or bot messages (supports loading spinner)."""
+    if is_loading:
+        return html.Div(
+            [
+                DashIconify(icon="mdi:robot", className="me-2"),
+                dbc.Spinner(size="sm", spinner_class_name="chat-message-text"),
+            ],
+            className="chat-message bot-message",
+            id="loading-message",
+        )
+
     icon_name = "mdi:account" if is_user else "mdi:robot"
     class_name = "user-message" if is_user else "bot-message"
     return html.Div(
-        [DashIconify(icon=icon_name, className="me-2"), html.Span(content, className="chat-message-text")],
+        [
+            DashIconify(icon=icon_name, className="me-2"),
+            dcc.Markdown(content, className="chat-message-text", link_target="_blank"),
+        ],
         className=f"chat-message {class_name}",
     )
+
 
 # ----------------------------------------------------------------------------
 # Callback registration (public)
@@ -146,25 +166,40 @@ def _create_chat_message(content: str, *, is_user: bool = True) -> html.Div:
 def register_chatbot_callbacks(app):  # type: ignore[arg-type]
     """Attach all Dash callbacks to app. Call this once during startup."""
 
-    # ----------------------- Assign per-tab UUID session ---------------------
+    # ----------------------- Assign browser-persistent UUID session ----------
     app.clientside_callback(
         """
         function(_) {
-            if (window._sessionId) return window._sessionId;
-            const s4 = () => Math.floor((1 + Math.random()) * 0x10000).toString(16).substring(1);
-            const uuid = () => `${s4()}${s4()}-${s4()}-${s4()}-${s4()}-${s4()}${s4()}${s4()}`;
-            window._sessionId = uuid();
-            return window._sessionId;
+            let sessionId = null;
+            try {
+                sessionId = localStorage.getItem("chatbot_session_id");
+                if (!sessionId) {
+                    const s4 = () => Math.floor((1 + Math.random()) * 0x10000).toString(16).substring(1);
+                    const uuid = () => `${s4()}${s4()}-${s4()}-${s4()}-${s4()}-${s4()}${s4()}${s4()}`;
+                    sessionId = uuid();
+                    localStorage.setItem("chatbot_session_id", sessionId);
+                }
+            } catch (e) {
+                if (!window._fallbackSessionId) {
+                    const s4 = () => Math.floor((1 + Math.random()) * 0x10000).toString(16).substring(1);
+                    const uuid = () => `${s4()}${s4()}-${s4()}-${s4()}-${s4()}-${s4()}${s4()}${s4()}`;
+                    window._fallbackSessionId = uuid();
+                }
+                sessionId = window._fallbackSessionId;
+            }
+            return sessionId;
         }
         """,
         Output("session-id", "data"),
         Input("drop-zone", "id"),
     )
 
-    # ----------------------- Chat handling -----------------------------------
+    # ----------------------- Phase 1: accept submission & show loader -------
     @app.callback(
-        Output("chat-messages", "children"),
-        [Input("send-btn", "n_clicks"), Input("chat-input", "n_submit")],  # Enter or button
+        Output("chat-messages", "children", allow_duplicate=True),
+        Output("response-trigger", "data"),
+        Output("send-btn", "disabled"),  # disable send during processing
+        [Input("send-btn", "n_clicks"), Input("chat-input", "n_submit")],
         [
             State("chat-input", "value"),
             State("chat-messages", "children"),
@@ -173,35 +208,70 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
         ],
         prevent_initial_call=True,
     )
-    def _handle_chat_message(
-        _n_clicks: Optional[int],
-        _n_submit: Optional[int],
+    def _handle_chat_submission(
+        _n_clicks: int,
+        _n_submit: int,
         message: Optional[str],
         messages: List[Any],
         rules: List[Dict[str, Any]],
         session_id: Optional[str],
-    ) -> List[Any]:
-        """Append user message & model reply to chat history (session-scoped)."""
-        logger.info("chat: trigger received (send=%s, submit=%s)", _n_clicks, _n_submit)
+    ) -> tuple[List[Any], Dict[str, Any] | None, bool]:
+        logger.info(
+            "[Chat UI] Received new message for session %s. (send=%s, submit=%s)",
+            session_id, _n_clicks, _n_submit
+        )
 
-        # Precondition checks
         if not session_id:
-            logger.warning("chat: missing session_id; ignoring turn")
-            return messages or []
+            raise PreventUpdate
         if not (message and str(message).strip()):
-            logger.debug("chat: empty message; ignoring")
-            return messages or []
+            raise PreventUpdate
 
-        updated = (messages or []) + [_create_chat_message(message, is_user=True)]
+        messages = messages or []
+
+        updated_messages = messages + [
+            _create_chat_message(message, is_user=True),
+            _create_chat_message("", is_user=False, is_loading=True),
+        ]
+
+        trigger_data = {
+            "message": message,
+            "rules": rules,
+            "session_id": session_id,
+            "seq": int(time() * 1000),  # ensure Store changes each time
+        }
+
+        return updated_messages, trigger_data, True  # disable send button
+
+    # ----------------------- Phase 2: compute reply & replace loader --------
+    @app.callback(
+        Output("chat-messages", "children", allow_duplicate=True),
+        Output("send-btn", "disabled"),  # re-enable send button
+        Input("response-trigger", "data"),
+        State("chat-messages", "children"),
+        prevent_initial_call=True,
+    )
+    def _handle_chat_response(
+        trigger_data: Dict[str, Any] | None,
+        messages: List[Any],
+    ) -> tuple[List[Any], bool]:
+        if not trigger_data:
+            raise PreventUpdate
+        messages = messages or []
+
+        message = trigger_data["message"]
+        rules = trigger_data["rules"]
+        session_id = trigger_data["session_id"]
 
         try:
-            reply = generate_response(message, rules or [], session_id=session_id)
+            logger.debug("[Chat UI] Generating response for session %s...", session_id)
+            reply = generate_response(message, rules, session_id=session_id)
+            logger.info("[Chat UI] Successfully generated response for session %s.", session_id)
         except Exception as e:
-            logger.exception("chat: generate_response failed: %s", e)
+            logger.exception("[Chat UI] Failed to generate response for session %s: %s", session_id, e)
             reply = "Sorry, something went wrong while generating a response."
 
-        updated.append(_create_chat_message(reply, is_user=False))
-        return updated
+        updated_messages = messages[:-1] + [_create_chat_message(reply, is_user=False)]
+        return updated_messages, False  # re-enable send button
 
     # ----------------------- Clear input after send --------------------------
     @app.callback(
@@ -233,12 +303,10 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
         except json.JSONDecodeError:
             raise PreventUpdate
 
-        # Remove
         if isinstance(action, dict) and "removeId" in action:
             rid = action["removeId"]
             return [r for r in (rules or []) if r.get("rule_id") != rid]
 
-        # Add
         if isinstance(action, dict) and "rule_id" in action:
             rule_id = action["rule_id"]
             rules = rules or []
@@ -303,5 +371,6 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
         Output("drop-zone-initialized", "data"),
         Input("drop-zone", "id")
     )
+
 
 __all__ = ["create_chatbot_component", "register_chatbot_callbacks"]
