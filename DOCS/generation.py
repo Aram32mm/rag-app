@@ -25,14 +25,14 @@ from __future__ import annotations
 import json
 import logging
 from time import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from dash import Input, Output, State, dcc, html
 import dash_bootstrap_components as dbc
 from dash.exceptions import PreventUpdate
 from dash_iconify import DashIconify
 
-# Local import – function that talks to your language-model backend (stubbed)
+# Model-side stub API (synchronous)
 from rag.generator import generate_response
 
 logger = logging.getLogger(__name__)
@@ -41,9 +41,9 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------------
 # UI FACTORY
 # ----------------------------------------------------------------------------
-
 def create_chatbot_component() -> dbc.Card:
     """Return the fully-assembled Chatbot card."""
+
     return dbc.Card(
         [
             # ---------- Header --------------------------------------------------
@@ -53,17 +53,23 @@ def create_chatbot_component() -> dbc.Card:
                     className="mb-0 fw-semibold",
                 )
             ),
+
             # ---------- Body ----------------------------------------------------
             dbc.CardBody(
                 [
                     # Session + stores / hidden inputs -------------------------
-                    dcc.Store(id="session-id"),                                # set via clientside UUID on load (localStorage)
-                    dcc.Store(id="stored-rules", data=[], storage_type="local"),
-                    dcc.Store(id="chat-history", data=None, storage_type="local"),
+                    # session-id: per-tab, in-memory only (never persisted) to ensure isolation
+                    dcc.Store(id="session-id"),
+                    # Persist selected rules across refresh (but not across browser sessions)
+                    dcc.Store(id="stored-rules", data=[], storage_type="session"),
+                    # Persist chat history by session (we namespace by session-id → see callbacks)
+                    dcc.Store(id="chat-history", storage_type="session"),
+                    # Drag/drop plumbing
                     dcc.Input(id="dropped-rule", type="text", style={"display": "none"}),
                     dcc.Store(id="drop-zone-initialized", data=False),
+                    # Two-phase send plumbing
                     dcc.Store(id="response-trigger", data=None),
-                    dcc.Store(id="chat-sending", data=False),                  # busy flag to control Send button
+                    dcc.Store(id="chat-sending", data=False),  # busy flag to control Send button
 
                     # Drop-zone ------------------------------------------------
                     html.Div(
@@ -84,7 +90,7 @@ def create_chatbot_component() -> dbc.Card:
                             html.Div(
                                 id="chat-messages",
                                 className="chat-messages mb-3",
-                                # Default greeting — replaced on load if chat-history is present
+                                # Default welcome message (replaced with history on load if present)
                                 children=[
                                     _create_chat_message(
                                         "Hi! I can help you analyse rules, create new ones, or answer questions. "
@@ -124,14 +130,13 @@ def create_chatbot_component() -> dbc.Card:
 # ----------------------------------------------------------------------------
 # Helper builders (private)
 # ----------------------------------------------------------------------------
-
 def _create_active_rule_chip(rule: Dict[str, Any]) -> dbc.Badge:
     """Return a pill-style badge representing an active rule."""
     rule_id = rule.get("rule_id", "")
     return dbc.Badge(
         [
             rule.get("rule_name", "Unnamed"),
-            html.Span("×", className="ms-2 remove-rule", **{"data-rule-id": rule_id}),
+            html.Span("×", className="ms-2 remove-rule remove-rule-btn", **{"data-rule-id": rule_id}),
         ],
         color="light",
         text_color="dark",
@@ -162,75 +167,66 @@ def _create_chat_message(content: str, *, is_user: bool = True, is_loading: bool
     )
 
 
-def _history_to_children(history: Optional[List[Dict[str, str]]]) -> List[Any]:
-    """Convert stored history (list of {'role','content'}) to message bubbles."""
-    if not history:
-        return []
-    out: List[Any] = []
-    for turn in history:
-        role = (turn.get("role") or "").lower()
-        content = turn.get("content") or ""
-        if role == "user":
-            out.append(_create_chat_message(content, is_user=True))
-        elif role == "assistant":
-            out.append(_create_chat_message(content, is_user=False))
-        # ignore system/meta roles for UI
-    return out
-
-
 # ----------------------------------------------------------------------------
 # Callback registration (public)
 # ----------------------------------------------------------------------------
-
 def register_chatbot_callbacks(app):  # type: ignore[arg-type]
     """Attach all Dash callbacks to app. Call this once during startup."""
 
-    # ---------- Assign browser-persistent UUID session (localStorage) --------
+    # ---------- Per-tab session id (in-memory only; never persisted) ----------
     app.clientside_callback(
         """
         function(_) {
-            let sessionId = null;
-            try {
-                sessionId = localStorage.getItem("chatbot_session_id");
-                if (!sessionId) {
-                    const s4 = () => Math.floor((1 + Math.random()) * 0x10000).toString(16).substring(1);
-                    const uuid = () => `${s4()}${s4()}-${s4()}-${s4()}-${s4()}-${s4()}${s4()}${s4()}`;
-                    sessionId = uuid();
-                    localStorage.setItem("chatbot_session_id", sessionId);
-                }
-            } catch (e) {
-                if (!window._fallbackSessionId) {
-                    const s4 = () => Math.floor((1 + Math.random()) * 0x10000).toString(16).substring(1);
-                    const uuid = () => `${s4()}${s4()}-${s4()}-${s4()}-${s4()}-${s4()}${s4()}${s4()}`;
-                    window._fallbackSessionId = uuid();
-                }
-                sessionId = window._fallbackSessionId;
+            // Always generate a fresh per-tab UUID (no browser storage).
+            if (window._tabSessionId) return window._tabSessionId;
+
+            let id = (crypto && crypto.randomUUID) ? crypto.randomUUID() : null;
+            if (!id) {
+                const s4 = () => Math.floor((1 + Math.random()) * 0x10000).toString(16).substring(1);
+                id = `${s4()}${s4()}-${s4()}-${s4()}-${s4()}-${s4()}${s4()}${s4()}`;
             }
-            return sessionId;
+            window._tabSessionId = id;
+            return id;
         }
         """,
         Output("session-id", "data"),
         Input("drop-zone", "id"),
     )
 
-    # ---------- On load: if chat-history exists, render it (else keep default)
+    # ---------- Load chat history (namespaced by session-id) on open ----------
     @app.callback(
         Output("chat-messages", "children", allow_duplicate=True),
         Input("session-id", "data"),
         State("chat-history", "data"),
         prevent_initial_call=True,
     )
-    def _restore_history(_session_id: Optional[str], history: Optional[List[Dict[str, str]]]):
-        if not history:
-            raise PreventUpdate  # keep the default greeting already on the page
-        return _history_to_children(history)
+    def _load_history_on_open(session_id: Optional[str], history_by_sid: Optional[Dict[str, List[Any]]]):
+        if not session_id:
+            logger.warning("[Chat UI] No session-id on open; leaving default welcome message.")
+            raise PreventUpdate
 
-    # ---------- Phase 1: accept submission & show loader (and persist user turn)
+        history_by_sid = history_by_sid or {}
+        history = history_by_sid.get(session_id)
+
+        if history:
+            logger.info("[Chat UI] Restored %d chat message(s) for session %s.", len(history), session_id)
+            return history
+
+        logger.info("[Chat UI] No prior chat history for session %s; showing default welcome.", session_id)
+        # Return default welcome if no history
+        return [
+            _create_chat_message(
+                "Hi! I can help you analyse rules, create new ones, or answer questions. "
+                "Drag some rules here to get started!",
+                is_user=False,
+            )
+        ]
+
+    # ---------- Phase 1: accept submission & show loader ----------
     @app.callback(
         Output("chat-messages", "children", allow_duplicate=True),
         Output("response-trigger", "data"),
-        Output("chat-sending", "data", allow_duplicate=True),   # set True
-        Output("chat-history", "data", allow_duplicate=True),   # append user turn
+        Output("chat-sending", "data", allow_duplicate=True),  # set True
         [Input("send-btn", "n_clicks"), Input("chat-input", "n_submit")],
         [
             State("chat-input", "value"),
@@ -238,7 +234,6 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
             State("stored-rules", "data"),
             State("session-id", "data"),
             State("chat-sending", "data"),
-            State("chat-history", "data"),
         ],
         prevent_initial_call=True,
     )
@@ -250,26 +245,25 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
         rules: List[Dict[str, Any]],
         session_id: Optional[str],
         sending: Optional[bool],
-        history: Optional[List[Dict[str, str]]],
-    ) -> tuple[List[Any], Dict[str, Any] | None, bool, List[Dict[str, str]]]:
-        # Ignore while busy to prevent space/Enter re-triggers
+    ) -> Tuple[List[Any], Dict[str, Any] | None, bool]:
+
         if sending:
+            logger.debug("[Chat UI] Submission ignored: still sending.")
             raise PreventUpdate
         if not session_id:
+            logger.warning("[Chat UI] Submission ignored: missing session_id.")
             raise PreventUpdate
         if not (message and str(message).strip()):
+            logger.debug("[Chat UI] Submission ignored: empty message.")
             raise PreventUpdate
 
         messages = messages or []
-        history = history or []
 
+        logger.info("[Chat UI] New submission (send=%s, submit=%s) for session %s.", _n_clicks, _n_submit, session_id)
         updated_messages = messages + [
             _create_chat_message(message, is_user=True),
             _create_chat_message("", is_user=False, is_loading=True),
         ]
-
-        # Append the user turn to persisted history
-        updated_history = history + [{"role": "user", "content": str(message)}]
 
         trigger_data = {
             "message": message,
@@ -278,31 +272,34 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
             "seq": int(time() * 1000),  # force Store delta each turn
         }
 
-        return updated_messages, trigger_data, True, updated_history  # now busy
+        logger.debug("[Chat UI] Emitting response trigger for session %s (seq=%s).", session_id, trigger_data["seq"])
+        return updated_messages, trigger_data, True  # now busy
 
-    # ---------- Phase 2: compute reply, replace loader, and persist assistant turn
+    # ---------- Phase 2: compute reply & replace loader ----------
     @app.callback(
         Output("chat-messages", "children", allow_duplicate=True),
         Output("chat-sending", "data", allow_duplicate=True),  # set False
-        Output("chat-history", "data", allow_duplicate=True),  # append assistant turn
         Input("response-trigger", "data"),
         State("chat-messages", "children"),
-        State("chat-history", "data"),
         prevent_initial_call=True,
     )
     def _handle_chat_response(
         trigger_data: Dict[str, Any] | None,
         messages: List[Any],
-        history: Optional[List[Dict[str, str]]],
-    ) -> tuple[List[Any], bool, List[Dict[str, str]]]:
+    ) -> Tuple[List[Any], bool]:
+
         if not trigger_data:
+            logger.debug("[Chat UI] Response phase invoked without trigger_data.")
             raise PreventUpdate
+
         messages = messages or []
-        history = history or []
 
         message = trigger_data["message"]
         rules = trigger_data["rules"]
         session_id = trigger_data["session_id"]
+        seq = trigger_data.get("seq")
+
+        logger.info("[Chat UI] Generating response for session %s (seq=%s).", session_id, seq)
 
         try:
             reply = generate_response(message, rules, session_id=session_id)
@@ -311,18 +308,39 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
             reply = "Sorry, something went wrong while generating a response."
 
         updated_messages = messages[:-1] + [_create_chat_message(reply, is_user=False)]
-        updated_history = history + [{"role": "assistant", "content": str(reply)}]
-        return updated_messages, False, updated_history  # no longer busy
+        logger.info("[Chat UI] Response ready; replacing loader (session=%s, seq=%s).", session_id, seq)
 
-    # ---------- Map busy store -> disable Send button (single writer)
+        return updated_messages, False  # no longer busy
+
+    # ---------- Persist chat history (namespaced by session-id) ----------
+    @app.callback(
+        Output("chat-history", "data"),
+        Input("chat-messages", "children"),
+        State("session-id", "data"),
+        State("chat-history", "data"),
+        prevent_initial_call=True,
+    )
+    def _persist_history(messages: List[Any], session_id: Optional[str], history_by_sid: Optional[Dict[str, List[Any]]]):
+        if not session_id:
+            logger.warning("[Chat UI] Skipping history persist: missing session_id.")
+            raise PreventUpdate
+
+        history_by_sid = history_by_sid or {}
+        history_by_sid[session_id] = messages or []
+        logger.debug("[Chat UI] Persisted %d message(s) for session %s.", len(history_by_sid[session_id]), session_id)
+        return history_by_sid
+
+    # ---------- Map busy store -> disable Send button (single writer) ----------
     @app.callback(
         Output("send-btn", "disabled"),
         Input("chat-sending", "data"),
     )
     def _toggle_send_disabled(sending: Optional[bool]) -> bool:
-        return bool(sending)
+        disabled = bool(sending)
+        logger.debug("[Chat UI] Send button disabled=%s.", disabled)
+        return disabled
 
-    # ---------- Clear input after send
+    # ---------- Clear input after send ----------
     @app.callback(
         Output("chat-input", "value"),
         [Input("send-btn", "n_clicks"), Input("chat-input", "n_submit")],
@@ -330,14 +348,17 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
         prevent_initial_call=True,
     )
     def _clear_input(_n_clicks: Optional[int], _n_submit: Optional[int], _value: Optional[str]):
+        logger.debug("[Chat UI] Clearing chat input after send.")
         return ""
 
-    # ---------- Render active rule chips
+    # ---------- Render active rule chips ----------
     @app.callback(Output("active-rules", "children"), Input("stored-rules", "data"))
     def _render_active_rule_chips(rules: List[Dict[str, Any]]):
-        return [_create_active_rule_chip(r) for r in (rules or [])]
+        chips = [_create_active_rule_chip(r) for r in (rules or [])]
+        logger.debug("[Chat UI] Rendered %d active rule chip(s).", len(chips))
+        return chips
 
-    # ---------- Update rule store (add/remove)
+    # ---------- Update rule store (add/remove) ----------
     @app.callback(
         Output("stored-rules", "data"),
         Input("dropped-rule", "value"),
@@ -346,26 +367,36 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
     )
     def _update_stored_rules(raw_input: Optional[str], rules: List[Dict[str, Any]]):
         if raw_input is None:
+            logger.debug("[Chat UI] No drop payload; ignoring.")
             raise PreventUpdate
+
         try:
             action = json.loads(raw_input)
         except json.JSONDecodeError:
+            logger.warning("[Chat UI] Invalid drop payload (not JSON); ignoring.")
             raise PreventUpdate
 
+        # Remove
         if isinstance(action, dict) and "removeId" in action:
             rid = action["removeId"]
-            return [r for r in (rules or []) if r.get("rule_id") != rid]
+            new_rules = [r for r in (rules or []) if r.get("rule_id") != rid]
+            logger.info("[Chat UI] Removed rule_id=%s (chips now=%d).", rid, len(new_rules))
+            return new_rules
 
+        # Add
         if isinstance(action, dict) and "rule_id" in action:
             rule_id = action["rule_id"]
             rules = rules or []
             if not any(r.get("rule_id") == rule_id for r in rules):
+                logger.info("[Chat UI] Added rule_id=%s (chips now=%d).", rule_id, len(rules) + 1)
                 return rules + [action]
+            logger.debug("[Chat UI] Drop ignored: rule_id=%s already present.", rule_id)
             return rules
 
+        logger.debug("[Chat UI] Drop payload had no actionable keys; ignoring.")
         raise PreventUpdate
 
-    # ---------- One-time JS for drag/drop + chip removal
+    # ---------- One-time JS for drag/drop + chip removal ----------
     app.clientside_callback(
         """
         function (_) {
@@ -399,7 +430,7 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
 
             // Remove rule chip
             activeDiv.addEventListener('click', e => {
-                const removeBtn = e.target.closest('.remove-rule');
+                const removeBtn = e.target.closest('.remove-rule-btn');
                 if (!removeBtn) return;
                 const id = removeBtn.getAttribute('data-rule-id');
                 if (!id) return;
