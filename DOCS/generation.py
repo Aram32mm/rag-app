@@ -46,23 +46,26 @@ def create_chatbot_component() -> dbc.Card:
     """Return the fully-assembled Chatbot card."""
     return dbc.Card(
         [
+            # ---------- Header --------------------------------------------------
             dbc.CardHeader(
                 html.H4(
                     [DashIconify(icon="mdi:robot-outline", className="me-2"), "Chatbot"],
                     className="mb-0 fw-semibold",
                 )
             ),
+            # ---------- Body ----------------------------------------------------
             dbc.CardBody(
                 [
-                    # Session + stores / hidden inputs
-                    dcc.Store(id="session-id"),                # set via clientside UUID on load (localStorage)
-                    dcc.Store(id="stored-rules", data=[]),
+                    # Session + stores / hidden inputs -------------------------
+                    dcc.Store(id="session-id"),                                # set via clientside UUID on load (localStorage)
+                    dcc.Store(id="stored-rules", data=[], storage_type="local"),
+                    dcc.Store(id="chat-history", data=None, storage_type="local"),
                     dcc.Input(id="dropped-rule", type="text", style={"display": "none"}),
                     dcc.Store(id="drop-zone-initialized", data=False),
                     dcc.Store(id="response-trigger", data=None),
-                    dcc.Store(id="chat-sending", data=False),  # busy flag to control Send button
+                    dcc.Store(id="chat-sending", data=False),                  # busy flag to control Send button
 
-                    # Drop-zone
+                    # Drop-zone ------------------------------------------------
                     html.Div(
                         [
                             DashIconify(icon="mdi:cloud-upload-outline", width=32, className="text-muted mb-2"),
@@ -72,15 +75,16 @@ def create_chatbot_component() -> dbc.Card:
                         className="drop-zone text-center py-4 mb-3",
                     ),
 
-                    # Active rule chips
+                    # Active rule chips ---------------------------------------
                     html.Div(id="active-rules", className="mb-3"),
 
-                    # Chat UI
+                    # Chat interface ------------------------------------------
                     html.Div(
                         [
                             html.Div(
                                 id="chat-messages",
                                 className="chat-messages mb-3",
+                                # Default greeting — replaced on load if chat-history is present
                                 children=[
                                     _create_chat_message(
                                         "Hi! I can help you analyse rules, create new ones, or answer questions. "
@@ -158,6 +162,22 @@ def _create_chat_message(content: str, *, is_user: bool = True, is_loading: bool
     )
 
 
+def _history_to_children(history: Optional[List[Dict[str, str]]]) -> List[Any]:
+    """Convert stored history (list of {'role','content'}) to message bubbles."""
+    if not history:
+        return []
+    out: List[Any] = []
+    for turn in history:
+        role = (turn.get("role") or "").lower()
+        content = turn.get("content") or ""
+        if role == "user":
+            out.append(_create_chat_message(content, is_user=True))
+        elif role == "assistant":
+            out.append(_create_chat_message(content, is_user=False))
+        # ignore system/meta roles for UI
+    return out
+
+
 # ----------------------------------------------------------------------------
 # Callback registration (public)
 # ----------------------------------------------------------------------------
@@ -193,11 +213,24 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
         Input("drop-zone", "id"),
     )
 
-    # ---------- Phase 1: accept submission & show loader (no duplicate outputs)
+    # ---------- On load: if chat-history exists, render it (else keep default)
+    @app.callback(
+        Output("chat-messages", "children", allow_duplicate=True),
+        Input("session-id", "data"),
+        State("chat-history", "data"),
+        prevent_initial_call=True,
+    )
+    def _restore_history(_session_id: Optional[str], history: Optional[List[Dict[str, str]]]):
+        if not history:
+            raise PreventUpdate  # keep the default greeting already on the page
+        return _history_to_children(history)
+
+    # ---------- Phase 1: accept submission & show loader (and persist user turn)
     @app.callback(
         Output("chat-messages", "children", allow_duplicate=True),
         Output("response-trigger", "data"),
-        Output("chat-sending", "data"),  # set True
+        Output("chat-sending", "data", allow_duplicate=True),   # set True
+        Output("chat-history", "data", allow_duplicate=True),   # append user turn
         [Input("send-btn", "n_clicks"), Input("chat-input", "n_submit")],
         [
             State("chat-input", "value"),
@@ -205,6 +238,7 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
             State("stored-rules", "data"),
             State("session-id", "data"),
             State("chat-sending", "data"),
+            State("chat-history", "data"),
         ],
         prevent_initial_call=True,
     )
@@ -216,7 +250,8 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
         rules: List[Dict[str, Any]],
         session_id: Optional[str],
         sending: Optional[bool],
-    ) -> tuple[List[Any], Dict[str, Any] | None, bool]:
+        history: Optional[List[Dict[str, str]]],
+    ) -> tuple[List[Any], Dict[str, Any] | None, bool, List[Dict[str, str]]]:
         # Ignore while busy to prevent space/Enter re-triggers
         if sending:
             raise PreventUpdate
@@ -226,11 +261,15 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
             raise PreventUpdate
 
         messages = messages or []
+        history = history or []
 
         updated_messages = messages + [
             _create_chat_message(message, is_user=True),
             _create_chat_message("", is_user=False, is_loading=True),
         ]
+
+        # Append the user turn to persisted history
+        updated_history = history + [{"role": "user", "content": str(message)}]
 
         trigger_data = {
             "message": message,
@@ -239,23 +278,27 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
             "seq": int(time() * 1000),  # force Store delta each turn
         }
 
-        return updated_messages, trigger_data, True  # now busy
+        return updated_messages, trigger_data, True, updated_history  # now busy
 
-    # ---------- Phase 2: compute reply & replace loader
+    # ---------- Phase 2: compute reply, replace loader, and persist assistant turn
     @app.callback(
         Output("chat-messages", "children", allow_duplicate=True),
-        Output("chat-sending", "data"),  # set False
+        Output("chat-sending", "data", allow_duplicate=True),  # set False
+        Output("chat-history", "data", allow_duplicate=True),  # append assistant turn
         Input("response-trigger", "data"),
         State("chat-messages", "children"),
+        State("chat-history", "data"),
         prevent_initial_call=True,
     )
     def _handle_chat_response(
         trigger_data: Dict[str, Any] | None,
         messages: List[Any],
-    ) -> tuple[List[Any], bool]:
+        history: Optional[List[Dict[str, str]]],
+    ) -> tuple[List[Any], bool, List[Dict[str, str]]]:
         if not trigger_data:
             raise PreventUpdate
         messages = messages or []
+        history = history or []
 
         message = trigger_data["message"]
         rules = trigger_data["rules"]
@@ -268,7 +311,8 @@ def register_chatbot_callbacks(app):  # type: ignore[arg-type]
             reply = "Sorry, something went wrong while generating a response."
 
         updated_messages = messages[:-1] + [_create_chat_message(reply, is_user=False)]
-        return updated_messages, False  # no longer busy
+        updated_history = history + [{"role": "assistant", "content": str(reply)}]
+        return updated_messages, False, updated_history  # no longer busy
 
     # ---------- Map busy store -> disable Send button (single writer)
     @app.callback(
